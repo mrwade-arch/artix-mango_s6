@@ -41,7 +41,7 @@ Automated installer for [Artix Linux](https://artixlinux.org/) (s6 init) + [Mang
 Boot the Artix base-s6 ISO, log in as root, then:
 
 ```bash
-curl -O https://raw.githubusercontent.com/YOUR_USERNAME/artix-mango/main/install-artix-mango.sh
+curl -O https://raw.githubusercontent.com/mrwade-arch/artix-mango_r6/main/install-artix-mango.sh
 bash install-artix-mango.sh
 ```
 
