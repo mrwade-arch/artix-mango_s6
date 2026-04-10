@@ -1,4 +1,4 @@
-# artix-mango
+# artix-mango_r6
 
 Automated installer for [Artix Linux](https://artixlinux.org/) (s6 init) + [MangoWM](https://github.com/mangowm/mango) — a dwm-style Wayland compositor.
 
