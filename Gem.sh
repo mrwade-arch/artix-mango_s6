@@ -1,69 +1,249 @@
 #!/usr/bin/env bash
-# set strict execution environment
 set -euo pipefail
 
-# ==============================================================================
-# CONFIGURATION VARIABLES
-# ==============================================================================
+# ================================================
+# Artix Linux s6 + MangoWM One-Shot Installer (Final Verified)
+# ================================================
+
+# ==================== CONFIGURABLE VARIABLES ====================
 HOSTNAME="wade-artix"
 USERNAME="wade"
-FULL_NAME="Wade"
-
-# WARNING: Set your plain-text password here before executing!
-# The script will hash it and use the hash for both root and the user account.
-PASSWORD=""
-
+PASSWORD="yup"  # <<< MUST BE SET BEFORE RUNNING
 DISK="/dev/sda"
 FILESYSTEM="ext4"
 SWAP_SIZE="16G"
-UEFI="yes"
 TIMEZONE="America/Los_Angeles"
 LOCALE="en_US.UTF-8"
 KEYMAP="us"
 
-# ==============================================================================
-# PRE-FLIGHT SAFETY CHECKS
-# ==============================================================================
+HTTP_PROXY="http://192.168.49.1:8282"
+HTTPS_PROXY="http://192.168.49.1:8282"
+NO_PROXY="localhost,127.0.0.1,::1,.local,192.168.0.0/16,10.0.0.0/8"
 
-# Ensure we are running as root
-if [[ $EUID -ne 0 ]]; then
-    echo "ERROR: This script must be run as root. Try: sudo ./install.sh"
+WIFI_SSID="DIRECT-NS-Hotspot"
+WIFI_PASS="hahahehe"
+
+BASE_PACKAGES=(
+    base base-devel linux linux-firmware
+    s6 elogind-s6 dbus-s6 connman-s6
+    grub efibootmgr os-prober dosfstools
+    pipewire wireplumber pipewire-pulse pipewire-alsa
+    alsa-utils pavucontrol
+    alacritty firefox
+    thunar thunar-archive-plugin thunar-volman
+    neovim wofi git sudo
+    waybar mako swaybg
+    xdg-desktop-portal-wlr xorg-xwayland
+)
+# ================================================================
+
+# ==================== LOGGING ====================
+LOGFILE="/root/artix-install.log"
+exec > >(tee -a "${LOGFILE}") 2>&1
+echo "=== Install started: $(date) ==="
+
+dmesg -n 1 2>/dev/null || true
+
+# ==================== ERROR TRAP ====================
+trap 'echo ""
+echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+echo "SCRIPT FAILED at line ${LINENO}"
+echo "Last command: ${BASH_COMMAND}"
+echo "Full log: ${LOGFILE}"
+echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"' ERR
+
+# ==================== HELPERS ====================
+# Resume/Skip logic using flags in /tmp
+skip_step() { [[ -f "/tmp/step_$1" ]]; }
+mark_done() { touch "/tmp/step_$1"; }
+
+retry() {
+    local attempts=$1 delay=$2
+    shift 2
+    local i=0
+    until "$@"; do
+        i=$(( i + 1 ))
+        if (( i >= attempts )); then
+            echo "ERROR: '$*' failed after ${attempts} attempts."
+            return 1
+        fi
+        echo ">>> Attempt ${i}/${attempts} failed. Retrying in ${delay}s..."
+        sleep "${delay}"
+    done
+}
+
+wifi_connect() {
+    echo ">>> Connecting to WiFi: ${WIFI_SSID} (nmcli)..."
+    nmcli device wifi connect "${WIFI_SSID}" password "${WIFI_PASS}" 2>/dev/null || true
+    sleep 4
+}
+
+check_net() {
+    local attempts=0 max=5
+    while (( attempts < max )); do
+        if curl -fsSL --proxy "${HTTP_PROXY}" --max-time 15 https://archlinux.org &>/dev/null; then
+            echo ">>> Internet OK."
+            return 0
+        fi
+        attempts=$(( attempts + 1 ))
+        echo ">>> No internet (attempt ${attempts}/${max}). Reconnecting..."
+        wifi_connect
+    done
+    echo "ERROR: Internet unavailable after ${max} attempts."
     exit 1
+}
+
+step() {
+    echo ""
+    echo "================================================================"
+    echo "  STEP: $*"
+    echo "================================================================"
+}
+
+# ==================== PRE-FLIGHT ====================
+step "Pre-flight checks"
+[[ -z "${PASSWORD}" ]] && { echo "ERROR: PASSWORD is empty."; exit 1; }
+[[ -b "${DISK}" ]] || { echo "ERROR: Disk ${DISK} not found."; exit 1; }
+
+echo "=== Artix s6 + MangoWM Installer ==="
+echo "Hostname: ${HOSTNAME} | User: ${USERNAME} | Disk: ${DISK}"
+#read -r -p "Type 'DESTROY' to wipe ${DISK} and install (Ctrl+C to abort): " CONFIRM
+#[[ "${CONFIRM}" == "DESTROY" ]] || { echo "Aborted."; exit 1; }
+
+export http_proxy="${HTTP_PROXY}" HTTP_PROXY="${HTTP_PROXY}"
+export https_proxy="${HTTPS_PROXY}" HTTPS_PROXY="${HTTPS_PROXY}"
+export no_proxy="${NO_PROXY}" NO_PROXY="${NO_PROXY}"
+
+# ==================== DISK PREP ====================
+if ! skip_step "parts"; then
+    step "Partitioning ${DISK}"
+    wipefs -af "${DISK}"
+    sfdisk --label gpt "${DISK}" <<EOF
+size=512MiB, type=uefi
+size=${SWAP_SIZE}, type=swap
+size=+, type=linux
+EOF
+    mark_done "parts"
 fi
 
-# Ensure password is provided
-if [[ -z "$PASSWORD" ]]; then
-    echo "ERROR: The PASSWORD variable is empty. Please edit the script and set a password."
-    exit 1
+EFI_PART="${DISK}1"
+SWAP_PART="${DISK}2"
+ROOT_PART="${DISK}3"
+sleep 2
+
+if ! skip_step "format"; then
+    step "Formatting"
+    mkfs.fat -F32 -n EFI "${EFI_PART}"
+    mkswap -L swap "${SWAP_PART}"
+    mkfs."${FILESYSTEM}" -F -L root "${ROOT_PART}"
+    mark_done "format"
 fi
 
-# Ensure internet connectivity
-echo "Checking internet connection..."
-if ! ping -c 3 archlinux.org > /dev/null 2>&1; then
-    echo "ERROR: No internet connection detected. Please connect and try again."
-    exit 1
+# ==================== MOUNTING ====================
+step "Mounting"
+mount "${ROOT_PART}" /mnt
+mkdir -p /mnt/boot/efi
+mount "${EFI_PART}" /mnt/boot/efi
+swapon "${SWAP_PART}"
+
+# ==================== INSTALLATION ====================
+if ! skip_step "base"; then
+    step "Basestrap"
+    check_net
+    retry 3 10 basestrap /mnt "${BASE_PACKAGES[@]}" --noconfirm
+    mark_done "base"
 fi
 
-# Final destructive warning
-echo "======================================================================"
-echo " WARNING: DESTRUCTIVE OPERATION AHEAD"
-echo "======================================================================"
-echo "This script will completely wipe $DISK."
-echo "All data on $DISK will be lost forever."
-echo "Press ENTER to continue or Ctrl+C to abort..."
-read -r
+fstabgen -U /mnt >> /mnt/etc/fstab
 
-# ==============================================================================
-# TIME SYNCHRONIZATION
-# ==============================================================================
-echo "Syncing system clock..."
-ntpd -qg || true
+# ==================== CHROOT 1: SYSTEM ====================
+step "Chroot 1: System Config"
+artix-chroot /mnt /bin/bash <<CHROOT1_EOF
+set -euo pipefail
+
+ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
 hwclock --systohc
+echo "${LOCALE} UTF-8" > /etc/locale.gen
+locale-gen
+echo "LANG=${LOCALE}" > /etc/locale.conf
+echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
+echo "${HOSTNAME}" > /etc/hostname
 
-# ==============================================================================
-# DISK PARTITIONING & FORMATTING
-# ==============================================================================
-echo "Wiping and partitioning $DISK..."
+echo "root:${PASSWORD}" | chpasswd
+
+echo "--- User and Groups ---"
+for grp in wheel audio video input storage; do
+    groupadd -r "\$grp" 2>/dev/null || true
+done
+useradd -m -G wheel,audio,video,input,storage -s /bin/bash "${USERNAME}"
+echo "${USERNAME}:${PASSWORD}" | chpasswd
+sleep 1
+id "${USERNAME}"
+
+echo "%wheel ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/wheel
+
+echo "--- s6 Services ---"
+mkdir -p /etc/s6/adminsv/default/contents.d
+# FIXED: connman instead of connmand
+for svc in dbus elogind connman; do
+    touch "/etc/s6/adminsv/default/contents.d/\$svc"
+done
+# This will warn in chroot but allows the system to compile on boot
+s6-db-reload || echo "Note: s6-db-reload skipped (normal in chroot)"
+
+echo "--- GRUB ---"
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --recheck
+grub-mkconfig -o /boot/grub/grub.cfg
+CHROOT1_EOF
+
+# ==================== CHROOT 2: AUR ====================
+step "Chroot 2: AUR Builds"
+artix-chroot /mnt /bin/bash <<CHROOT2_EOF
+set -euo pipefail
+
+echo "--- paru ---"
+paru_ok=0
+for attempt in 1 2 3; do
+    rm -rf /tmp/paru
+    if su - "${USERNAME}" -c '
+        export http_proxy="${HTTP_PROXY}"
+        export https_proxy="${HTTPS_PROXY}"
+        git clone https://aur.archlinux.org/paru.git /tmp/paru && cd /tmp/paru && makepkg -si --noconfirm
+    '; then
+        paru_ok=1
+        break
+    fi
+    sleep 5
+done
+[[ \$paru_ok -eq 1 ]] || exit 1
+
+echo "--- MangoWM ---"
+su - "${USERNAME}" -c '
+    export http_proxy="${HTTP_PROXY}"
+    export https_proxy="${HTTPS_PROXY}"
+    paru -S --noconfirm --needed mangowm-git
+'
+
+# Config setup
+mkdir -p "/home/${USERNAME}/.config/mango"
+cat > "/home/${USERNAME}/.config/mango/config.conf" <<'MANGO_EOF'
+bind=SUPER,Return,spawn,alacritty
+bind=SUPER,d,spawn,wofi --show drun
+bind=SUPER,q,killclient
+bind=SUPER+SHIFT,q,quit
+exec-once=pipewire
+exec-once=wireplumber
+exec-once=pipewire-pulse
+exec-once=waybar &
+exec-once=mako &
+MANGO_EOF
+chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config"
+CHROOT2_EOF
+
+step "Done. Unmounting..."
+umount -R /mnt
+swapoff -a
+echo "Install Finished. Reboot and login as ${USERNAME}."
 
 # Determine partition prefix (for nvme/mmcblk drives)
 PART_PREFIX=""
