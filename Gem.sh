@@ -259,11 +259,7 @@ pacman -S --noconfirm --needed git base-devel
 paru_ok=0
 for attempt in 1 2 3; do
     rm -rf /tmp/paru
-    if su - "$USERNAME" -c "
-    env http_proxy='$HTTP_PROXY' https_proxy='$HTTPS_PROXY' \
-    git clone https://aur.archlinux.org/paru.git /tmp/paru &&
-    cd /tmp/paru &&
-    makepkg -si --noconfirm --needed"; then
+    if su - "$USERNAME" -c "env http_proxy='$HTTP_PROXY' https_proxy='$HTTPS_PROXY' git clone https://aur.archlinux.org/paru.git /tmp/paru && cd /tmp/paru && makepkg -si --noconfirm --needed"; then
         paru_ok=1
         break
     fi
@@ -271,10 +267,7 @@ for attempt in 1 2 3; do
 done
 [[ \$paru_ok -eq 1 ]] || exit 1
 
-su - "$USERNAME" -c "
-    env http_proxy='$HTTP_PROXY' https_proxy='$HTTPS_PROXY' \
-    paru -S --noconfirm --needed mangowm-git
-"
+su - "$USERNAME" -c "env http_proxy='$HTTP_PROXY' https_proxy='$HTTPS_PROXY' paru -S --noconfirm --needed mangowm-git"
 
 mkdir -p "/home/$USERNAME/.config/mango"
 cat > "/home/$USERNAME/.config/mango/config.conf" <<MANGO
