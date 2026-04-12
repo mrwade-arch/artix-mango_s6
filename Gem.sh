@@ -263,9 +263,7 @@ for attempt in 1 2 3; do
     env http_proxy='$HTTP_PROXY' https_proxy='$HTTPS_PROXY' \
     git clone https://aur.archlinux.org/paru.git /tmp/paru &&
     cd /tmp/paru &&
-    makepkg -si --noconfirm --needed
-"
-    "; then
+    makepkg -si --noconfirm --needed"; then
         paru_ok=1
         break
     fi
