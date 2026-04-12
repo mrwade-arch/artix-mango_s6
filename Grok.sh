@@ -1,295 +1,283 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ================================================
+#############################################
 # Artix Linux s6 + MangoWM One-Shot Installer
-# ================================================
-# This is a complete, production-grade, one-time installation script.
-# Run as root in the official artix-s6.iso live environment AFTER connecting to the internet.
-# It will wipe the target disk (after explicit confirmation), install a minimal but fully functional
-# Artix s6 system with MangoWM (Wayland compositor) as the primary WM, and reboot into it.
-#
-# All configurable options are at the top. Password is plain-text here (script hashes it safely
-# via chpasswd). User must set PASSWORD before running.
-# ================================================
+#    tailored for /dev/sda single-user setup
+#############################################
 
-# ==================== CONFIGURABLE VARIABLES ====================
+# ---- CONFIGURATION ----
 HOSTNAME="wade-artix"
 USERNAME="wade"
-FULL_NAME="Wade"
-PASSWORD=""  # <<< MUST BE FILLED IN BY USER BEFORE RUNNING (plain text, same for root + user)
+PASSWORD="yup"      # <-- Set your user password here!
 DISK="/dev/sda"
-FILESYSTEM="ext4"          # Best performance for mechanical HDDs
-SWAP_SIZE="16G"            # Suitable for 8GB+ RAM systems
-UEFI="yes"                 # "yes" for UEFI (512M EFI partition), "no" for legacy BIOS
+FILESYSTEM="ext4"
+SWAP_SIZE="16G"
 TIMEZONE="America/Los_Angeles"
 LOCALE="en_US.UTF-8"
 KEYMAP="us"
+WIFI_SSID="kellys-Pixel"
+WIFI_PASS="kellyluvstommy!"
 
-# Essential packages for basestrap (base system + s6 + core desktop prerequisites)
 BASE_PACKAGES=(
-    base
-    base-devel
-    linux
-    linux-firmware
-    s6
-    elogind-s6
-    dbus-s6
-    connman-s6
-    grub
-    efibootmgr
-    os-prober
-    pipewire
-    wireplumber
-    pipewire-pulse
-    pipewire-alsa
-    alsa-utils
-    pavucontrol
-    alacritty
-    firefox
-    thunar
-    thunar-archive-plugin
-    thunar-volman
-    neovim
-    wofi
-    git
-    sudo
+    base base-devel linux linux-firmware
+    intel-ucode
+    s6 elogind-s6 dbus-s6 connman-s6
+    grub efibootmgr os-prober dosfstools
+    pipewire wireplumber pipewire-pulse pipewire-alsa
+    alsa-utils pavucontrol
+    alacritty firefox
+    thunar thunar-archive-plugin thunar-volman
+    neovim wofi git sudo
+    waybar mako swaybg
+    xdg-desktop-portal-wlr xorg-xwayland
 )
 
-# ================================================================
+LOGFILE="/root/artix-install.log"
+FLAGBASE="/tmp/artixmango"
 
-# Safety guard: PASSWORD must be set
-if [[ -z "${PASSWORD}" ]]; then
-    echo "ERROR: PASSWORD variable is empty. Edit the script and set a strong password before running."
+EFI_PART="${DISK}1"
+SWAP_PART="${DISK}2"
+ROOT_PART="${DISK}3"
+
+# ---- LOGGING & FLAGS ----
+exec > >(tee -a "$LOGFILE") 2>&1
+trap 'echo -e "\n\n!!! FAILURE at line ${LINENO}: ${BASH_COMMAND}\nSee $LOGFILE\n"; exit 1' ERR
+step()   { echo -e "\n\033[1;32m== $*\033[0m"; }
+flag()   { [ -f "${FLAGBASE}-$1" ]; }
+mark()   { touch "${FLAGBASE}-$1"; }
+
+# ---- NETWORK HELPERS ----
+wifi_connect() {
+    nmcli device wifi connect "$WIFI_SSID" password "$WIFI_PASS" 2>/dev/null || true
+    sleep 4
+}
+
+check_net() {
+    for i in {1..5}; do
+        if curl -fsSL --max-time 15 https://archlinux.org &>/dev/null; then
+            echo ">>> Network OK."
+            return 0
+        fi
+        echo ">>> No internet (try $i/5), retrying WiFi"
+        wifi_connect
+    done
+    echo "ERROR: No Internet, cannot continue."
     exit 1
+}
+
+# ---- STATE CHECKS ----
+partitioned_ok() {
+    [ -b "$EFI_PART" ] && [ -b "$SWAP_PART" ] && [ -b "$ROOT_PART" ]
+}
+
+formatted_ok() {
+    blkid "$EFI_PART"   | grep -q 'FAT' &&
+    blkid "$SWAP_PART"  | grep -q 'swap' &&
+    blkid "$ROOT_PART"  | grep -qi "$FILESYSTEM"
+}
+
+mounted_ok() {
+    mountpoint -q /mnt && mountpoint -q /mnt/boot/efi
+}
+
+# ---- PRE-FLIGHT ----
+step "Artix + MangoWM 1-shot Installer (/dev/sda)"
+[ -n "$PASSWORD" ] || { echo "ERROR: Set PASSWORD!"; exit 1; }
+[ -b "$DISK" ]    || { echo "ERROR: Disk $DISK not found"; exit 1; }
+
+if ! flag confirm; then
+    echo "HOSTNAME: $HOSTNAME   USER: $USERNAME   DISK: $DISK"
+    read -rp "Type 'DESTROY' to WIPE $DISK and install: " CONFIRM
+    [[ "$CONFIRM" == "DESTROY" ]] || { echo "ABORT!"; exit 1; }
+    mark confirm
 fi
 
-# Safety checks
-echo "=== Artix s6 + MangoWM Installer ==="
-echo "This script will COMPLETELY WIPE ${DISK} and install a fresh system."
-echo "Hostname: ${HOSTNAME} | User: ${USERNAME} | WM: MangoWM (Wayland)"
-read -r -p "Type 'DESTROY' to continue (or Ctrl+C to abort): " CONFIRM
-if [[ "${CONFIRM}" != "DESTROY" ]]; then
-    echo "Aborted by user."
-    exit 1
+step "Checking network"
+check_net
+
+# ---- KEYRING / MIRROR ----
+if ! flag keyring; then
+    step "Keyring/mirror update"
+    pacman -Sy --noconfirm artix-keyring artix-mirrorlist
+    mark keyring
 fi
 
-# Check internet connectivity (required for pacman and AUR)
-echo "Checking internet connectivity..."
-if ! ping -c 1 -W 5 archlinux.org &>/dev/null; then
-    echo "ERROR: No internet connection. Connect to the network first (e.g. connman or iwctl)."
-    exit 1
-fi
-echo "Internet OK."
-
-# Update live environment and refresh Artix mirrors
-echo "Updating live system and Artix mirrors..."
-pacman -Syy --noconfirm
-pacman -Syu --noconfirm --needed artix-mirrorlist
-
-# Automated disk partitioning (GPT, destructive)
-echo "Partitioning ${DISK} (WARNING: all data will be lost)..."
-wipefs -af "${DISK}"
-partprobe "${DISK}"
-
-if [[ "${UEFI}" == "yes" ]]; then
-    # UEFI layout: 512M EFI + SWAP + ROOT
-    sfdisk --label gpt "${DISK}" <<EOF
-label: gpt
-size=512MiB, type=EF00, name="EFI"
-size=${SWAP_SIZE}, type=8200, name="SWAP"
-, type=8304, name="ROOT"
+# ---- PARTITION ----
+if ! flag parts; then
+    if partitioned_ok; then
+        echo ">>> Partitions exist, skipping partitioning."
+    else
+        step "Partitioning ${DISK}"
+        wipefs -af "$DISK"
+        sfdisk --force --label gpt "$DISK" <<EOF
+size=512MiB, type=uefi
+size=$SWAP_SIZE, type=swap
+size=+, type=linux
 EOF
-    EFI_PART="${DISK}1"
-    SWAP_PART="${DISK}2"
-    ROOT_PART="${DISK}3"
-else
-    # Legacy BIOS: SWAP + ROOT (no EFI)
-    sfdisk --label dos "${DISK}" <<EOF
-size=${SWAP_SIZE}, type=82, name="SWAP"
-, type=83, name="ROOT"
-EOF
-    EFI_PART=""
-    SWAP_PART="${DISK}1"
-    ROOT_PART="${DISK}2"
+        partprobe "$DISK" || true
+        sleep 2
+    fi
+    mark parts
 fi
-partprobe "${DISK}"
 
-# Format partitions
-echo "Formatting partitions..."
-if [[ "${UEFI}" == "yes" ]]; then
-    mkfs.fat -F32 -n EFI "${EFI_PART}"
+# ---- FORMAT ----
+if ! flag format; then
+    if formatted_ok; then
+        echo ">>> Filesystems OK, skipping format."
+    else
+        step "Formatting"
+        blkid "$EFI_PART"   | grep -q 'FAT'  || mkfs.fat -F32 -n EFI  "$EFI_PART"
+        blkid "$SWAP_PART"  | grep -q 'swap' || mkswap    -L swap "$SWAP_PART"
+        blkid "$ROOT_PART"  | grep -qi "$FILESYSTEM" || mkfs.$FILESYSTEM -F -L root "$ROOT_PART"
+    fi
+    mark format
 fi
-mkswap -L swap "${SWAP_PART}"
-mkfs."${FILESYSTEM}" -F -L root "${ROOT_PART}"
 
-# Mount everything
-echo "Mounting filesystems..."
-mount "${ROOT_PART}" /mnt
-mkdir -p /mnt/boot
-if [[ "${UEFI}" == "yes" ]]; then
-    mount "${EFI_PART}" /mnt/boot
+# ---- MOUNT ----
+if ! flag mount; then
+    if mounted_ok; then
+        echo ">>> Mounts OK, skipping mounting."
+    else
+        step "Mounting"
+        umount -R /mnt 2>/dev/null || true
+        mkdir -p /mnt/boot/efi
+        mount "$ROOT_PART" /mnt
+        mkdir -p /mnt/boot/efi
+        mount "$EFI_PART" /mnt/boot/efi
+        swapon "$SWAP_PART" 2>/dev/null || true
+    fi
+    mark mount
 fi
-swapon "${SWAP_PART}"
 
-# Basestrap base s6 system + essentials
-echo "Installing base system with basestrap (Artix s6)..."
-basestrap /mnt "${BASE_PACKAGES[@]}" --noconfirm
+# ---- BASESTRAP ----
+if ! flag base; then
+    step "Installing base system"
+    check_net
+    basestrap /mnt "${BASE_PACKAGES[@]}" --noconfirm
+    [[ -d /mnt/usr/bin ]] || { echo "basestrap failed!"; exit 1; }
+    mark base
+fi
 
-# Generate fstab
-echo "Generating fstab..."
-fstabgen -U /mnt >> /mnt/etc/fstab
+# ---- FSTAB ----
+if ! flag fstab; then
+    fstabgen -U /mnt >> /mnt/etc/fstab
+    mark fstab
+fi
 
-# ==================== CHROOT PHASE ====================
-echo "Entering chroot for final configuration..."
-
-artix-chroot /mnt /bin/bash <<'CHROOT_EOF'
+# ---- CHROOT SYSTEM CONFIG ----
+if ! flag config; then
+step "System config in chroot"
+artix-chroot /mnt /bin/bash <<CHROOT1_EOF
 set -euo pipefail
 
-# Set timezone, locale, keymap, hostname
-echo "Configuring locale, timezone, hostname..."
-ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
+ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 hwclock --systohc
-echo "${LOCALE} UTF-8" > /etc/locale.gen
+echo "$LOCALE UTF-8" > /etc/locale.gen
 locale-gen
-echo "LANG=${LOCALE}" > /etc/locale.conf
-echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
-echo "${HOSTNAME}" > /etc/hostname
-cat > /etc/hosts <<EOF
+echo "LANG=$LOCALE"   > /etc/locale.conf
+echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
+echo "$HOSTNAME"     > /etc/hostname
+cat > /etc/hosts <<EOF2
 127.0.0.1   localhost
 ::1         localhost
-127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
-EOF
+127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
+EOF2
 
-# Root and user accounts (same password for both)
-echo "Creating root and user accounts..."
-echo "root:${PASSWORD}" | chpasswd
-useradd -m -G wheel,audio,video,input,storage -s /bin/bash "${USERNAME}"
-echo "${USERNAME}:${PASSWORD}" | chpasswd
-echo "${FULL_NAME}" > "/home/${USERNAME}/.fullname" 2>/dev/null || true
-echo "%wheel ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/wheel
+# Set root password
+echo "root:$PASSWORD" | chpasswd
 
-# s6 service management - enable core services
-echo "Enabling s6-rc services (networking, dbus, elogind, connman)..."
-mkdir -p /etc/s6/adminsv/default/contents.d
-for svc in dbus elogind connmand; do
-    touch "/etc/s6/adminsv/default/contents.d/${svc}"
+# Robust, idempotent group/user logic
+for grp in wheel audio video input storage; do
+    getent group "\$grp" >/dev/null || groupadd -r "\$grp"
 done
-# Compile s6 database (Artix s6 standard)
-s6-rc-compile -v /etc/s6/rc/compiled /etc/s6/sv || true
+id -u "$USERNAME" &>/dev/null && userdel -r "$USERNAME" || true
+useradd -m -G wheel,audio,video,input,storage -s /bin/bash "$USERNAME"
+echo "$USERNAME:$PASSWORD" | chpasswd
 
-# Install AUR helper (paru) as regular user for MangoWM
-echo "Installing paru AUR helper as ${USERNAME}..."
+echo "%wheel ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/wheel
+chmod 440 /etc/sudoers.d/wheel
+
+# Enable s6/elogind/connman
+mkdir -p /etc/s6/adminsv/default/contents.d
+for svc in dbus elogind connman; do
+    touch "/etc/s6/adminsv/default/contents.d/\${svc}"
+done
+s6-db-reload || echo "Note: s6-db-reload skipped (in chroot ok)"
+
+# GRUB install
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --recheck
+grub-mkconfig -o /boot/grub/grub.cfg
+
+CHROOT1_EOF
+mark config
+fi
+
+# ---- CHROOT: AUR + MangoWM ----
+if ! flag aur; then
+step "AUR + MangoWM in user env"
+artix-chroot /mnt /bin/bash <<CHROOT2_EOF
+set -euo pipefail
+
+# Ensure DNS works inside chroot
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+
+# Quick network check INSIDE chroot
+curl -Is --max-time 10 https://aur.archlinux.org || {
+    echo "No internet inside chroot"
+    exit 1
+}
+
 pacman -S --noconfirm --needed git base-devel
-su - "${USERNAME}" -c '
-    git clone https://aur.archlinux.org/paru.git /tmp/paru
-    cd /tmp/paru
-    makepkg -si --noconfirm --needed
+
+paru_ok=0
+for attempt in 1 2 3; do
     rm -rf /tmp/paru
-'
+    if su - "$USERNAME" -c "git clone https://aur.archlinux.org/paru.git /tmp/paru && cd /tmp/paru && makepkg -si --noconfirm --needed"; then
+        paru_ok=1
+        break
+    fi
+    sleep 10
+done
+[[ \$paru_ok -eq 1 ]] || exit 1
 
-# Install MangoWM from AUR (Wayland compositor based on dwl)
-echo "Installing MangoWM and dependencies..."
-su - "${USERNAME}" -c "paru -S --noconfirm --needed mangowm"
+su - "$USERNAME" -c "paru -S --noconfirm --needed mangowm-git"
 
-# Minimal MangoWM configuration (usable desktop with terminal, launcher, keybinds)
-echo "Creating minimal MangoWM configuration for ${USERNAME}..."
-mkdir -p "/home/${USERNAME}/.config/mango"
-cat > "/home/${USERNAME}/.config/mango/config.conf" <<'MANGO_CONFIG'
-# MangoWM minimal config (dwl-style Wayland compositor)
-# Terminal: alacritty
-# Launcher: wofi (drun mode)
-# Basic keybinds (SUPER = Mod4)
-
-# Core actions
+mkdir -p "/home/$USERNAME/.config/mango"
+cat > "/home/$USERNAME/.config/mango/config.conf" <<MANGO
+# MangoWM config
 bind=SUPER,Return,spawn,alacritty
 bind=SUPER,d,spawn,wofi --show drun
 bind=SUPER,q,killclient
-bind=SUPER,Shift,q,quit
-bind=SUPER,f,toggle_fullscreen
-
-# Focus movement
-bind=ALT,Left,focusmon,-1
-bind=ALT,Right,focusmon,1
-bind=ALT,Up,focusmon,-1
-bind=ALT,Down,focusmon,1
-
-# Tag / workspace switching (1-9)
-bind=CTRL,1,view,1
-bind=CTRL,2,view,2
-bind=CTRL,3,view,3
-bind=CTRL,4,view,4
-bind=CTRL,5,view,5
-bind=CTRL,6,view,6
-bind=CTRL,7,view,7
-bind=CTRL,8,view,8
-bind=CTRL,9,view,9
-
-# Move window to tag
-bind=ALT,1,sendtomon,1
-bind=ALT,2,sendtomon,2
-bind=ALT,3,sendtomon,3
-bind=ALT,4,sendtomon,4
-bind=ALT,5,sendtomon,5
-bind=ALT,6,sendtomon,6
-bind=ALT,7,sendtomon,7
-bind=ALT,8,sendtomon,8
-bind=ALT,9,sendtomon,9
-
-# Autostart audio (pipewire + wireplumber) and other essentials
+bind=SUPER+SHIFT,q,quit
+bind=SUPER,f,togglefullscreen
 exec-once=pipewire
 exec-once=wireplumber
 exec-once=pipewire-pulse
+exec-once=waybar &
+exec-once=mako &
+MANGO
 
-# Recommended defaults
-terminal=alacritty
-launcher=wofi --show drun
-MANGO_CONFIG
-
-# Autostart MangoWM on tty1 login (clean s6 + Wayland method)
-echo "Setting up automatic MangoWM autostart on tty1..."
-cat > "/home/${USERNAME}/.bash_profile" <<'BASH_PROFILE'
-# Autostart MangoWM on first virtual terminal (tty1)
-if [ -z "${WAYLAND_DISPLAY}" ] && [ "${XDG_VTNR}" -eq 1 ]; then
-    # Ensure pipewire is ready (audio)
-    pipewire > /dev/null 2>&1 &
-    wireplumber > /dev/null 2>&1 &
-    sleep 1
+cat > "/home/$USERNAME/.bash_profile" <<'BASH_PROFILE'
+if [ -z "\${WAYLAND_DISPLAY}" ] && [ "\${XDG_VTNR}" -eq 1 ]; then
     exec mango
 fi
 BASH_PROFILE
 
-# Fix permissions
-chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config" "/home/${USERNAME}/.bash_profile"
+chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/.config" "/home/$USERNAME/.bash_profile"
 
-# GRUB bootloader
-echo "Installing GRUB bootloader..."
-if [[ "${UEFI}" == "yes" ]]; then
-    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --recheck
-else
-    grub-install --target=i386-pc "${DISK}"
+CHROOT2_EOF
+mark aur
 fi
-grub-mkconfig -o /boot/grub/grub.cfg
 
-# Final cleanup
-echo "Final system cleanup..."
-pacman -Scc --noconfirm
-rm -rf /var/cache/pacman/pkg/*
-
-echo "=== Installation complete inside chroot ==="
-CHROOT_EOF
-
-# Unmount and finish
-echo "Unmounting filesystems..."
-umount -R /mnt/boot 2>/dev/null || true
-umount -R /mnt
+# ---- UNMOUNT & FINAL ----
+step "Unmounting"
+umount -R /mnt || echo "umount error ignored"
 swapoff -a
 
-echo "Installation finished successfully!"
-echo "You can now reboot into your new Artix s6 + MangoWM system."
-read -r -p "Reboot now? (y/N): " REBOOT
-if [[ "${REBOOT}" =~ ^[Yy]$ ]]; then
-    reboot
-else
-    echo "Run 'reboot' manually when ready."
-fi
+echo -e "\n=============================================="
+echo "INSTALL COMPLETE — $(date)"
+echo "Remove USB and reboot!"
+echo "=============================================="
+read -rp "Reboot now? (y/N): " REBOOT
+[[ "$REBOOT" =~ ^[Yy]$ ]] && reboot || echo "Run 'reboot' when ready."
