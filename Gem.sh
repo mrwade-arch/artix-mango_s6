@@ -241,16 +241,30 @@ artix-chroot /mnt /bin/bash <<CHROOT2_EOF
 set -euo pipefail
 . /etc/profile.d/proxy.sh
 
+# Ensure DNS works inside chroot (cheap, reliable fix)
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+
+# Force git to respect proxy
+git config --global http.proxy "$HTTP_PROXY"
+git config --global https.proxy "$HTTPS_PROXY"
+
+# Quick network check INSIDE chroot
+curl -I --proxy "$HTTP_PROXY" --max-time 10 https://aur.archlinux.org || {
+    echo "No internet inside chroot"
+    exit 1
+}
+
 pacman -S --noconfirm --needed git base-devel
+
 paru_ok=0
 for attempt in 1 2 3; do
     rm -rf /tmp/paru
-    if su - "$USERNAME" -c '
-        export http_proxy="'"$HTTP_PROXY"'"
-        export https_proxy="'"$HTTPS_PROXY"'"
+    if su - "$USERNAME" -c "
+        env http_proxy=$HTTP_PROXY https_proxy=$HTTPS_PROXY \
         git clone https://aur.archlinux.org/paru.git /tmp/paru &&
-        cd /tmp/paru && makepkg -si --noconfirm --needed
-    '; then
+        cd /tmp/paru &&
+        makepkg -si --noconfirm --needed
+    "; then
         paru_ok=1
         break
     fi
@@ -258,11 +272,10 @@ for attempt in 1 2 3; do
 done
 [[ \$paru_ok -eq 1 ]] || exit 1
 
-su - "$USERNAME" -c '
-    export http_proxy="'"$HTTP_PROXY"'"
-    export https_proxy="'"$HTTPS_PROXY"'"
+su - "$USERNAME" -c "
+    env http_proxy=$HTTP_PROXY https_proxy=$HTTPS_PROXY \
     paru -S --noconfirm --needed mangowm-git
-'
+"
 
 mkdir -p "/home/$USERNAME/.config/mango"
 cat > "/home/$USERNAME/.config/mango/config.conf" <<MANGO
