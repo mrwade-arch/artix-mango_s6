@@ -162,7 +162,7 @@ fi
 # Phase 1: partition
 # -------------------------------
 partition_disk(){
-  if [[ "$RESUME" == "1" && is_done partitioned ]]; then
+  if [[ "$RESUME" == "1" ]] && is_done partitioned; then
     info "Skipping partitioning (already marked done)."
     return
   fi
@@ -186,7 +186,7 @@ partition_disk(){
 # Phase 2: format
 # -------------------------------
 format_partitions(){
-  if [[ "$RESUME" == "1" && is_done formatted ]]; then
+  if [[ "$RESUME" == "1" ]] && is_done formatted; then
     info "Skipping formatting (already marked done)."
     return
   fi
@@ -207,7 +207,7 @@ format_partitions(){
 # Phase 3: mount
 # -------------------------------
 mount_filesystems(){
-  if [[ "$RESUME" == "1" && is_done mounted ]]; then
+  if [[ "$RESUME" == "1" ]] && is_done mounted; then
     info "Skipping mount step (already marked done)."
     return
   fi
@@ -223,7 +223,7 @@ mount_filesystems(){
 # Phase 4: base install
 # -------------------------------
 install_base(){
-  if [[ "$RESUME" == "1" && is_done basestrap ]]; then
+  if [[ "$RESUME" == "1" ]] && is_done basestrap; then
     info "Skipping base install (already marked done)."
     return
   fi
@@ -238,7 +238,7 @@ install_base(){
 # Phase 5: chroot config
 # -------------------------------
 chroot_config(){
-  if [[ "$RESUME" == "1" && is_done chroot ]]; then
+  if [[ "$RESUME" == "1" ]] && is_done chroot; then
     info "Skipping chroot config (already marked done)."
     return
   fi
