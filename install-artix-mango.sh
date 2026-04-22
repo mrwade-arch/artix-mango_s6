@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  install-artix-mango.sh
-#  One-shot Artix Linux + s6 + MangoWM installer
+#  Artix Linux + s6 + MangoWM — One-Shot Installer
 #  Target : HP ProDesk Mini (Intel HD/UHD Graphics)
-#  Init   : s6 / s6-rc
-#  WM     : MangoWM (Wayland-native, XWayland compat layer included)
-#  Usage  : Boot Artix ISO → edit CONFIG block below → sudo bash install-artix-mango.sh
+#  Usage  : Boot Artix ISO → edit CONFIG block → sudo bash install-artix-mango.sh
+#  Re-run : safe — completed phases are skipped automatically
 # =============================================================================
 
 set -euo pipefail
@@ -20,44 +19,85 @@ info()  { echo -e "${BLU}[INFO]${RST}  $*"; }
 ok()    { echo -e "${GRN}[ OK ]${RST}  $*"; }
 warn()  { echo -e "${YLW}[WARN]${RST}  $*"; }
 die()   { echo -e "${RED}[FAIL]${RST}  $*" >&2; exit 1; }
-step()  { echo -e "\n${BOLD}${CYN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}";
-          echo -e "${BOLD}${CYN}  ▶  $*${RST}";
-          echo -e "${BOLD}${CYN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}\n"; }
+skip()  { echo -e "${CYN}[SKIP]${RST}  $* — already done"; }
+step()  {
+  echo -e "\n${BOLD}${CYN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}"
+  echo -e "${BOLD}${CYN}  ▶  $*${RST}"
+  echo -e "${BOLD}${CYN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}\n"
+}
 
 # =============================================================================
 # CONFIG — edit before running
 # =============================================================================
-DISK="${DISK:-/dev/sda}"            # Override: DISK=/dev/nvme0n1 ./install-artix-mango.sh
+DISK="${DISK:-/dev/sda}"           # override: DISK=/dev/nvme0n1 sudo bash install-artix-mango.sh
 HOSTNAME="${HOSTNAME:-mangodesk}"
 USERNAME="${USERNAME:-wade}"
 LOCALE="en_US.UTF-8"
-TIMEZONE="America/Los_Angeles"      # Hillsboro, OR
+TIMEZONE="America/Los_Angeles"     # Hillsboro, OR
 KEYMAP="us"
 MOUNT="/mnt"
 BOOT_SIZE="512M"
-SWAP_SIZE="8G"                      # Set to "" to skip swap partition
+SWAP_SIZE="8G"                     # set to "" to skip swap
 # =============================================================================
 
-# ─── Package Lists ────────────────────────────────────────────────────────────
+# ─── Checkpoint system ────────────────────────────────────────────────────────
+# On first run: state file lives in /tmp (RAM).
+# Once the target disk is mounted: state migrates there so it survives
+# a reboot back to the ISO mid-install.
+# Each phase is idempotent — re-running skips completed phases.
+STATE_FILE="/tmp/.artix-mango.state"
 
+checkpoint() {
+  echo "$1" >> "$STATE_FILE"
+  ok "Checkpoint saved: $1"
+}
+
+done_already() {
+  grep -qx "$1" "$STATE_FILE" 2>/dev/null
+}
+
+migrate_state() {
+  [[ -f "$STATE_FILE" ]] && cp "$STATE_FILE" "$MOUNT/.artix-mango.state"
+  STATE_FILE="$MOUNT/.artix-mango.state"
+}
+
+restore_state() {
+  # If we're resuming after a reboot, try to mount root and pull state back.
+  [[ -b "$DISK" ]] || return
+  local try_root=""
+  if [[ "$DISK" == *"nvme"* || "$DISK" == *"mmcblk"* ]]; then
+    try_root="${DISK}p3"
+  else
+    try_root="${DISK}3"
+  fi
+  [[ -b "$try_root" ]] || return
+
+  mkdir -p "$MOUNT" 2>/dev/null || true
+  if mount "$try_root" "$MOUNT" 2>/dev/null; then
+    if [[ -f "$MOUNT/.artix-mango.state" ]]; then
+      cp "$MOUNT/.artix-mango.state" "$STATE_FILE"
+      warn "Prior run detected — resuming. Completed phases will be skipped:"
+      cat "$STATE_FILE"
+      echo ""
+    fi
+    umount "$MOUNT" 2>/dev/null || true
+  fi
+}
+
+# ─── Package lists ────────────────────────────────────────────────────────────
 BASE_PKGS=(
-  # Core
   base base-devel
   linux linux-headers linux-firmware
-  intel-ucode                          # HP Mini — Intel CPU (Skylake / UHD)
+  intel-ucode
 
-  # Init
-  s6 s6-rc s6-boot-scripts
-  elogind elogind-s6                   # Seat/session management
+  s6 s6-rc s6-scripts
+  elogind elogind-s6
 
-  # Bootloader
   grub efibootmgr os-prober
 
-  # Network
   networkmanager networkmanager-s6
-  iwd                                  # WiFi backend if needed
+  iwd
 
-  # Essentials
   sudo vim git curl wget rsync
   man-db man-pages
   bash-completion
@@ -66,200 +106,196 @@ BASE_PKGS=(
 )
 
 WAYLAND_PKGS=(
-  # Wayland core
   wayland wayland-protocols
-
-  # XWayland — X11 compat for Burp Suite, Android Studio, legacy GTK, etc.
-  xorg-xwayland xorg-xlsclients
-
-  # Input
+  xorg-xwayland xorg-xlsclients     # X11 compat — Burp Suite, Android Studio, etc.
   libinput
-
-  # Intel GPU (HD Graphics 530 / UHD 630)
   mesa lib32-mesa
   vulkan-intel lib32-vulkan-intel
   intel-media-driver
-  libva-intel-driver                   # VA-API for hardware video decode
-
-  # wlroots compositor base (MangoWM dep)
+  libva-intel-driver
   wlroots
-
-  # Audio — PipeWire stack
   pipewire pipewire-pulse pipewire-alsa pipewire-jack
   wireplumber
   pavucontrol
-
-  # Portals
-  xdg-desktop-portal
-  xdg-desktop-portal-wlr
-
-  # PolicyKit
+  xdg-desktop-portal xdg-desktop-portal-wlr
   polkit polkit-s6
 )
 
 DESKTOP_PKGS=(
-  # Terminal
-  foot                                 # Wayland-native, fast
-
-  # Launcher
-  fuzzel                               # Lightweight Wayland launcher
-
-  # Bar
-  waybar
-
-  # Notifications
-  mako
-
-  # Wallpaper + lock
-  swaybg
-  swaylock
-
-  # Screenshot
+  foot fuzzel waybar mako
+  swaybg swaylock
   grim slurp
-
-  # Clipboard
   wl-clipboard
-
-  # File manager
   thunar gvfs
-
-  # Fonts
   noto-fonts noto-fonts-emoji noto-fonts-cjk
-  ttf-jetbrains-mono
-  ttf-font-awesome                     # Waybar icons
-
-  # Media
-  playerctl
-  mpv
-
-  # Misc utilities
+  ttf-jetbrains-mono ttf-font-awesome
+  playerctl mpv
   brightnessctl
-  unzip p7zip
-  jq
-  fzf
-  ripgrep fd
-  bat eza                              # Modern ls/cat replacements
-  zoxide                               # Smart cd
+  unzip p7zip jq fzf
+  ripgrep fd bat eza zoxide
 )
 
 # ─── Sanity checks ────────────────────────────────────────────────────────────
-[[ $EUID -eq 0 ]]                   || die "Must run as root."
-[[ -d /sys/firmware/efi ]]          || die "UEFI not detected — boot in UEFI mode."
-[[ -b "$DISK" ]]                    || die "Disk $DISK not found. Set DISK= env var or edit CONFIG."
-command -v basestrap &>/dev/null    || die "basestrap not found — run this from the Artix live ISO."
+[[ $EUID -eq 0 ]]                 || die "Must run as root."
+[[ -d /sys/firmware/efi ]]        || die "UEFI not detected — boot in UEFI mode."
+[[ -b "$DISK" ]]                  || die "Disk $DISK not found. Set DISK= or edit CONFIG."
+command -v basestrap &>/dev/null  || die "basestrap not found — run from the Artix live ISO."
+
+restore_state
 
 # ─── Banner + confirm ─────────────────────────────────────────────────────────
-clear
-echo -e "${BOLD}${CYN}"
-cat <<'BANNER'
-  ┌─────────────────────────────────────────────────┐
-  │      ARTIX LINUX  ·  s6  ·  MangoWM             │
-  │      One-Shot Installer — HP ProDesk Mini        │
-  └─────────────────────────────────────────────────┘
+if ! done_already "CONFIRMED"; then
+  clear
+  echo -e "${BOLD}${CYN}"
+  cat <<'BANNER'
+  ┌──────────────────────────────────────────────────┐
+  │   ARTIX LINUX  ·  s6  ·  MangoWM                │
+  │   One-Shot Installer — HP ProDesk Mini           │
+  └──────────────────────────────────────────────────┘
 BANNER
-echo -e "${RST}"
-echo -e "  ${BOLD}Disk${RST}     : ${YLW}${DISK}${RST}"
-echo -e "  ${BOLD}Hostname${RST} : ${YLW}${HOSTNAME}${RST}"
-echo -e "  ${BOLD}User${RST}     : ${YLW}${USERNAME}${RST}"
-echo -e "  ${BOLD}Timezone${RST} : ${YLW}${TIMEZONE}${RST}"
-echo -e "  ${BOLD}Swap${RST}     : ${YLW}${SWAP_SIZE:-none}${RST}"
-echo ""
-warn "ALL DATA ON ${DISK} WILL BE PERMANENTLY DESTROYED."
-echo -en "${MAG}  Type 'yes' to continue: ${RST}"
-read -r CONFIRM
-[[ "$CONFIRM" == "yes" ]] || die "Aborted by user."
+  echo -e "${RST}"
+  echo -e "  ${BOLD}Disk${RST}     : ${YLW}${DISK}${RST}"
+  echo -e "  ${BOLD}Hostname${RST} : ${YLW}${HOSTNAME}${RST}"
+  echo -e "  ${BOLD}User${RST}     : ${YLW}${USERNAME}${RST}"
+  echo -e "  ${BOLD}Timezone${RST} : ${YLW}${TIMEZONE}${RST}"
+  echo -e "  ${BOLD}Swap${RST}     : ${YLW}${SWAP_SIZE:-none}${RST}"
+  echo ""
+  warn "ALL DATA ON ${DISK} WILL BE PERMANENTLY DESTROYED."
+  echo -en "${MAG}  Type 'yes' to continue: ${RST}"
+  read -r CONFIRM
+  [[ "$CONFIRM" == "yes" ]] || die "Aborted by user."
+  checkpoint "CONFIRMED"
+fi
 
-# =============================================================================
-# PHASE 1 — DISK PARTITIONING & FORMATTING
-# =============================================================================
-step "Partitioning: $DISK"
-
-# Partition naming: NVMe uses p1/p2, SATA/SCSI uses 1/2
+# ─── Partition prefix ─────────────────────────────────────────────────────────
 if [[ "$DISK" == *"nvme"* || "$DISK" == *"mmcblk"* ]]; then
   P="${DISK}p"
 else
   P="${DISK}"
 fi
 
-wipefs -af "$DISK"
-sgdisk --zap-all "$DISK"
-
 if [[ -n "${SWAP_SIZE}" ]]; then
-  PART_BOOT="${P}1"
-  PART_SWAP="${P}2"
-  PART_ROOT="${P}3"
-  sgdisk \
-    -n 1:0:+${BOOT_SIZE} -t 1:ef00 -c 1:"EFI" \
-    -n 2:0:+${SWAP_SIZE} -t 2:8200 -c 2:"swap" \
-    -n 3:0:0             -t 3:8300 -c 3:"root" \
-    "$DISK"
+  PART_BOOT="${P}1"; PART_SWAP="${P}2"; PART_ROOT="${P}3"
 else
-  PART_BOOT="${P}1"
-  PART_ROOT="${P}2"
-  PART_SWAP=""
-  sgdisk \
-    -n 1:0:+${BOOT_SIZE} -t 1:ef00 -c 1:"EFI" \
-    -n 2:0:0             -t 2:8300 -c 2:"root" \
-    "$DISK"
+  PART_BOOT="${P}1"; PART_SWAP="";    PART_ROOT="${P}2"
 fi
 
-partprobe "$DISK"
-sleep 1
+# =============================================================================
+# PHASE 1 — PARTITION
+# =============================================================================
+if done_already "PARTITIONED"; then
+  skip "Disk partitioning"
+else
+  step "Partitioning: $DISK"
+  wipefs -af "$DISK"
+  sgdisk --zap-all "$DISK"
 
-step "Formatting partitions"
-mkfs.fat -F32 -n EFI "$PART_BOOT"
-ok "Boot partition formatted (FAT32)"
+  if [[ -n "${SWAP_SIZE}" ]]; then
+    sgdisk \
+      -n 1:0:+${BOOT_SIZE} -t 1:ef00 -c 1:"EFI"  \
+      -n 2:0:+${SWAP_SIZE} -t 2:8200 -c 2:"swap" \
+      -n 3:0:0             -t 3:8300 -c 3:"root"  \
+      "$DISK"
+  else
+    sgdisk \
+      -n 1:0:+${BOOT_SIZE} -t 1:ef00 -c 1:"EFI" \
+      -n 2:0:0             -t 2:8300 -c 2:"root" \
+      "$DISK"
+  fi
 
-if [[ -n "${PART_SWAP:-}" ]]; then
-  mkswap -L swap "$PART_SWAP"
-  swapon "$PART_SWAP"
-  ok "Swap created and enabled"
+  partprobe "$DISK"; sleep 1
+  checkpoint "PARTITIONED"
 fi
 
-mkfs.ext4 -L artix-root "$PART_ROOT"
-ok "Root partition formatted (ext4)"
+# =============================================================================
+# PHASE 2 — FORMAT
+# =============================================================================
+if done_already "FORMATTED"; then
+  skip "Formatting"
+else
+  step "Formatting partitions"
+  mkfs.fat -F32 -n EFI "$PART_BOOT"
+  ok "EFI formatted (FAT32)"
 
-step "Mounting filesystems"
-mount "$PART_ROOT" "$MOUNT"
-mkdir -p "$MOUNT/boot/efi"
-mount "$PART_BOOT" "$MOUNT/boot/efi"
-ok "Filesystems mounted at $MOUNT"
+  if [[ -n "${PART_SWAP}" ]]; then
+    mkswap -L swap "$PART_SWAP"
+    swapon "$PART_SWAP"
+    ok "Swap created"
+  fi
+
+  mkfs.ext4 -L artix-root "$PART_ROOT"
+  ok "Root formatted (ext4)"
+  checkpoint "FORMATTED"
+fi
 
 # =============================================================================
-# PHASE 2 — BASE INSTALL
+# PHASE 3 — MOUNT
 # =============================================================================
-step "Running basestrap"
-basestrap "$MOUNT" "${BASE_PKGS[@]}"
-ok "Base packages installed"
+if done_already "MOUNTED"; then
+  skip "Mounting"
+  mountpoint -q "$MOUNT"          || mount "$PART_ROOT" "$MOUNT"
+  mountpoint -q "$MOUNT/boot/efi" || { mkdir -p "$MOUNT/boot/efi"; mount "$PART_BOOT" "$MOUNT/boot/efi"; }
+else
+  step "Mounting filesystems"
+  mount "$PART_ROOT" "$MOUNT"
+  mkdir -p "$MOUNT/boot/efi"
+  mount "$PART_BOOT" "$MOUNT/boot/efi"
+  ok "Mounted at $MOUNT"
+  checkpoint "MOUNTED"
+fi
 
-step "Generating /etc/fstab"
-fstabgen -U "$MOUNT" >> "$MOUNT/etc/fstab"
-ok "fstab written"
+migrate_state   # state file now lives on the target disk
 
 # =============================================================================
-# PHASE 3 — CHROOT CONFIGURATION
+# PHASE 4 — BASESTRAP
 # =============================================================================
-step "Entering chroot for system configuration"
+if done_already "BASESTRAP"; then
+  skip "Basestrap"
+else
+  step "Running basestrap"
+  basestrap "$MOUNT" "${BASE_PKGS[@]}"
+  ok "Base packages installed"
 
-# Export variables for heredoc
-export HOSTNAME USERNAME LOCALE TIMEZONE KEYMAP
+  fstabgen -U "$MOUNT" >> "$MOUNT/etc/fstab"
+  ok "fstab written"
+  checkpoint "BASESTRAP"
+fi
+
+# =============================================================================
+# PHASE 5 — CHROOT
+# =============================================================================
+if done_already "CHROOT"; then
+  skip "Chroot configuration"
+else
+  step "Entering chroot"
+
+  # FIX 3: Write all variables explicitly to a file on the target disk.
+  # More reliable than relying on env var inheritance through artix-chroot.
+  cat > "$MOUNT/tmp/install-vars.sh" <<EOF
+export HOSTNAME="${HOSTNAME}"
+export USERNAME="${USERNAME}"
+export LOCALE="${LOCALE}"
+export TIMEZONE="${TIMEZONE}"
+export KEYMAP="${KEYMAP}"
 export WAYLAND_PKGS_STR="${WAYLAND_PKGS[*]}"
 export DESKTOP_PKGS_STR="${DESKTOP_PKGS[*]}"
+EOF
 
-artix-chroot "$MOUNT" /bin/bash <<'CHROOT'
+  artix-chroot "$MOUNT" /bin/bash <<'CHROOT'
 set -euo pipefail
+source /tmp/install-vars.sh
 
 RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'; RST='\033[0m'
 ok()   { echo -e "${GRN}[ OK ]${RST}  $*"; }
+warn() { echo -e "${YLW}[WARN]${RST}  $*"; }
 info() { echo -e "\e[34m[INFO]\e[0m  $*"; }
 
 # ── Locale ────────────────────────────────────────────────────────
-info "Configuring locale..."
 sed -i "s/^#${LOCALE} UTF-8/${LOCALE} UTF-8/" /etc/locale.gen
 locale-gen
 echo "LANG=${LOCALE}"   > /etc/locale.conf
 echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
-ok "Locale set to ${LOCALE}"
+ok "Locale: ${LOCALE}"
 
 # ── Timezone ──────────────────────────────────────────────────────
 ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
@@ -275,46 +311,38 @@ cat > /etc/hosts <<EOF
 EOF
 ok "Hostname: ${HOSTNAME}"
 
-# ── Pacman tweaks ─────────────────────────────────────────────────
+# ── Pacman ────────────────────────────────────────────────────────
 sed -i \
   -e 's/^#ParallelDownloads.*/ParallelDownloads = 10/' \
   -e 's/^#Color/Color/' \
   -e '/^#\[multilib\]/,/^#Include/ s/^#//' \
   /etc/pacman.conf
-pacman -Sy --noconfirm
-ok "Pacman configured (parallel downloads, color, multilib)"
+pacman -Syy --noconfirm
+ok "Pacman configured"
 
-# ── Wayland + Desktop packages ────────────────────────────────────
-info "Installing Wayland stack and desktop packages..."
+# ── Packages ──────────────────────────────────────────────────────
+info "Installing Wayland + desktop packages..."
 # shellcheck disable=SC2086
 pacman -S --noconfirm --needed $WAYLAND_PKGS_STR $DESKTOP_PKGS_STR
-ok "Wayland and desktop packages installed"
+ok "Packages installed"
 
-# ── s6 Services ───────────────────────────────────────────────────
-info "Enabling s6 services..."
-
-# s6 service directories vary slightly between Artix versions
-# Try both common paths
-S6_SV_DIR=""
-for d in /etc/s6/sv /etc/s6-rc/compiled /run/service; do
-  [[ -d "$d" ]] && S6_SV_DIR="$d" && break
-done
-
-# s6-rc compiled database path
-S6_ADMIN="${S6_ADMIN:-/etc/s6/adminsv}"
+# ── s6 services ───────────────────────────────────────────────────
+# FIX 5: Verify each service path exists before symlinking.
+# Warn clearly if not found so user can fix post-boot rather than silently failing.
+S6_SV="/etc/s6/sv"
+S6_ADMIN="/etc/s6/adminsv"
 [[ -d "$S6_ADMIN" ]] || mkdir -p "$S6_ADMIN"
-
 for svc in NetworkManager elogind polkit; do
-  if [[ -d "/etc/s6/sv/${svc}" ]]; then
-    ln -sf "/etc/s6/sv/${svc}" "${S6_ADMIN}/" 2>/dev/null || true
-    ok "Service linked: ${svc}"
+  if [[ -d "${S6_SV}/${svc}" ]]; then
+    ln -sf "${S6_SV}/${svc}" "${S6_ADMIN}/${svc}"
+    ok "s6: enabled ${svc}"
   else
-    echo -e "${YLW}[WARN]${RST}  Service dir not found: /etc/s6/sv/${svc} — link manually post-boot"
+    warn "s6: ${S6_SV}/${svc} not found — enable manually after boot:"
+    warn "  ln -sf ${S6_SV}/${svc} ${S6_ADMIN}/${svc}"
   fi
 done
 
-# ── Bootloader (GRUB, UEFI) ───────────────────────────────────────
-info "Installing GRUB..."
+# ── GRUB ──────────────────────────────────────────────────────────
 grub-install \
   --target=x86_64-efi \
   --efi-directory=/boot/efi \
@@ -322,105 +350,127 @@ grub-install \
   --recheck
 sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=3/' /etc/default/grub
 grub-mkconfig -o /boot/grub/grub.cfg
-ok "GRUB installed and configured"
+ok "GRUB installed"
 
-# ── Root password ─────────────────────────────────────────────────
+# ── Passwords ─────────────────────────────────────────────────────
 echo "root:toor" | chpasswd
-echo -e "${YLW}[WARN]${RST}  Root password set to 'toor' — change immediately after first boot"
+warn "Root password: 'toor' — change immediately after first boot"
 
-# ── User account ──────────────────────────────────────────────────
+# ── User + groups ─────────────────────────────────────────────────
+# FIX 1: Create each group if missing so useradd never fails on an
+# absent group (e.g. 'network' is not always present by default).
+for grp in wheel audio video input storage optical network; do
+  getent group "$grp" &>/dev/null || groupadd "$grp"
+done
+
 if ! id "${USERNAME}" &>/dev/null; then
-  useradd -m -G wheel,audio,video,input,storage,optical,network \
+  useradd -m \
+    -G wheel,audio,video,input,storage,optical,network \
     -s /bin/bash "${USERNAME}"
   echo "${USERNAME}:changeme" | chpasswd
-  echo -e "${YLW}[WARN]${RST}  ${USERNAME} password set to 'changeme' — change after first boot"
+  warn "${USERNAME} password: 'changeme' — change after first boot"
+  ok "User ${USERNAME} created"
 else
-  ok "User ${USERNAME} already exists, skipping creation"
+  ok "User ${USERNAME} already exists — skipping"
 fi
 
-# Passwordless sudo for wheel
 cat > /etc/sudoers.d/10-wheel <<'EOF'
 %wheel ALL=(ALL:ALL) ALL
 EOF
 chmod 440 /etc/sudoers.d/10-wheel
-ok "Sudo configured for wheel group"
+ok "Sudo configured"
 
-# ── PipeWire session startup ──────────────────────────────────────
-# PipeWire is started as a user service via systemd --user normally,
-# but with s6 we'll start it from MangoWM's startup script
-ok "PipeWire will be started from MangoWM startup script"
-
-# ── AUR helper: paru ──────────────────────────────────────────────
-info "Installing paru (AUR helper)..."
+# ── paru ──────────────────────────────────────────────────────────
 if ! command -v paru &>/dev/null; then
+  info "Installing paru..."
   cd /tmp
   git clone https://aur.archlinux.org/paru-bin.git
   chown -R "${USERNAME}:${USERNAME}" paru-bin
   cd paru-bin
   sudo -u "${USERNAME}" makepkg -si --noconfirm
+  cd / && rm -rf /tmp/paru-bin
   ok "paru installed"
 else
   ok "paru already present"
 fi
 
-# ── MangoWM from AUR ──────────────────────────────────────────────
+# ── MangoWM ───────────────────────────────────────────────────────
+# FIX 2: Try all known AUR package names — whichever succeeds wins.
 info "Installing MangoWM from AUR..."
-sudo -u "${USERNAME}" paru -S --noconfirm mangowm || {
-  echo -e "${YLW}[WARN]${RST}  MangoWM AUR install failed — try: paru -S mangowm after first boot"
-}
+MANGO_INSTALLED=false
+for pkg in mangowm mango mango-wm; do
+  if sudo -u "${USERNAME}" paru -S --noconfirm "$pkg" 2>/dev/null; then
+    ok "MangoWM installed via AUR package: $pkg"
+    MANGO_INSTALLED=true
+    break
+  fi
+done
+$MANGO_INSTALLED || warn "MangoWM AUR install failed — run 'paru -S mangowm' after first boot"
 
+# Detect and record the actual installed binary name for .bash_profile
+MANGO_BIN=""
+for b in mango mangowm mango-wm; do
+  command -v "$b" &>/dev/null && MANGO_BIN="$b" && break
+done
+echo "${MANGO_BIN}" > /tmp/mango-bin
+[[ -n "$MANGO_BIN" ]] && ok "MangoWM binary: $MANGO_BIN" || warn "MangoWM binary not detected"
+
+rm -f /tmp/install-vars.sh
 CHROOT
 
-ok "Chroot configuration complete"
+  checkpoint "CHROOT"
+fi
 
 # =============================================================================
-# PHASE 4 — USER CONFIG FILES
+# PHASE 6 — USER CONFIGS
 # =============================================================================
-step "Deploying user config files"
+if done_already "CONFIGS"; then
+  skip "Config deployment"
+else
+  step "Deploying user configs"
 
-UHOME="$MOUNT/home/$USERNAME"
-CFG="$UHOME/.config"
-mkdir -p \
-  "$CFG/mango" \
-  "$CFG/foot" \
-  "$CFG/waybar" \
-  "$CFG/fuzzel" \
-  "$CFG/mako" \
-  "$CFG/swaylock" \
-  "$UHOME/.local/share" \
-  "$UHOME/screenshots" \
-  "$UHOME/src"
+  UHOME="$MOUNT/home/$USERNAME"
+  CFG="$UHOME/.config"
 
-# ── MangoWM config ────────────────────────────────────────────────
-# NOTE: MangoWM uses a Lua-based or TOML-based config depending on version.
-# Adjust key bindings to taste. Run `mango --help` for the actual config
-# format used by your installed version.
-cat > "$CFG/mango/config.lua" <<'EOF'
+  mkdir -p \
+    "$CFG/mango" "$CFG/foot" "$CFG/waybar" \
+    "$CFG/fuzzel" "$CFG/mako" "$CFG/swaylock" \
+    "$UHOME/.local/share/mango" \
+    "$UHOME/screenshots" "$UHOME/src"
+
+  # Read binary name written by chroot — fallback to empty (detected at login)
+  MANGO_BIN=""
+  [[ -f "$MOUNT/tmp/mango-bin" ]] && MANGO_BIN="$(cat "$MOUNT/tmp/mango-bin")"
+  rm -f "$MOUNT/tmp/mango-bin"
+
+  # ── MangoWM config — Lua ────────────────────────────────────────
+  # FIX 6: Use swaybg -c (solid color) — no wallpaper file needed.
+  # Drop a wallpaper.jpg in ~/.config/mango/ and swap the swaybg line to use it.
+  cat > "$CFG/mango/config.lua" <<'EOF'
 -- MangoWM config — HP ProDesk Mini
--- Mod key
+-- Run `mango --help` or `mangowm --help` to confirm your build's config API.
 local mod = "super"
 
--- Gaps & borders
 gaps(8)
 border(2)
-border_color("#58a6ff", "#30363d")    -- active, inactive
+border_color("#58a6ff", "#30363d")   -- active, inactive
 
--- Startup
+-- Autostart
 spawn("waybar")
 spawn("mako")
-spawn("swaybg -i ~/.config/mango/wallpaper.jpg -m fill")
+spawn("swaybg -c '#0d1117'")         -- swap for: swaybg -i ~/.config/mango/wallpaper.jpg -m fill
 spawn("pipewire")
 spawn("pipewire-pulse")
 spawn("wireplumber")
 
--- Keybinds
-bind(mod, "Return",   spawn("foot"))
-bind(mod, "d",        spawn("fuzzel"))
-bind(mod, "q",        close())
+-- Core binds
+bind(mod, "Return", spawn("foot"))
+bind(mod, "d",      spawn("fuzzel"))
+bind(mod, "q",      close())
 bind(mod .. "+Shift", "r", reload())
 bind(mod .. "+Shift", "q", quit())
 
--- Focus
+-- Focus (vim-style)
 bind(mod, "h", focus("left"))
 bind(mod, "j", focus("down"))
 bind(mod, "k", focus("up"))
@@ -432,34 +482,26 @@ bind(mod .. "+Shift", "j", move("down"))
 bind(mod .. "+Shift", "k", move("up"))
 bind(mod .. "+Shift", "l", move("right"))
 
--- Workspaces
+-- Workspaces 1–9
 for i = 1, 9 do
   bind(mod, tostring(i), workspace(i))
   bind(mod .. "+Shift", tostring(i), move_to_workspace(i))
 end
 
--- Screenshot (requires grim + slurp)
 bind(mod, "p", spawn('grim -g "$(slurp)" ~/screenshots/$(date +%Y%m%d_%H%M%S).png'))
-
--- Screen lock
 bind(mod .. "+ctrl", "l", spawn("swaylock"))
 
--- Volume (PipeWire/WirePlumber)
-bind("", "XF86AudioRaiseVolume",  spawn("wpctl set-volume @DEFAULT_SINK@ 5%+"))
-bind("", "XF86AudioLowerVolume",  spawn("wpctl set-volume @DEFAULT_SINK@ 5%-"))
-bind("", "XF86AudioMute",         spawn("wpctl set-mute @DEFAULT_SINK@ toggle"))
-
--- Media keys
-bind("", "XF86AudioPlay",  spawn("playerctl play-pause"))
-bind("", "XF86AudioNext",  spawn("playerctl next"))
-bind("", "XF86AudioPrev",  spawn("playerctl previous"))
+bind("", "XF86AudioRaiseVolume", spawn("wpctl set-volume @DEFAULT_SINK@ 5%+"))
+bind("", "XF86AudioLowerVolume", spawn("wpctl set-volume @DEFAULT_SINK@ 5%-"))
+bind("", "XF86AudioMute",        spawn("wpctl set-mute @DEFAULT_SINK@ toggle"))
+bind("", "XF86AudioPlay",        spawn("playerctl play-pause"))
+bind("", "XF86AudioNext",        spawn("playerctl next"))
+bind("", "XF86AudioPrev",        spawn("playerctl previous"))
 EOF
 
-# Also drop a TOML variant in case this version of MangoWM uses TOML
-cat > "$CFG/mango/config.toml" <<'EOF'
-# MangoWM config (TOML format) — HP ProDesk Mini
-# Uncomment and use if your MangoWM build expects TOML, not Lua.
-
+  # ── MangoWM config — TOML (keep both; delete whichever doesn't apply) ──
+  cat > "$CFG/mango/config.toml" <<'EOF'
+# MangoWM config (TOML) — use if your build expects TOML instead of Lua.
 [general]
 gaps = 8
 border_width = 2
@@ -469,12 +511,9 @@ mod = "super"
 
 [startup]
 exec = [
-  "waybar",
-  "mako",
-  "swaybg -i ~/.config/mango/wallpaper.jpg -m fill",
-  "pipewire",
-  "pipewire-pulse",
-  "wireplumber",
+  "waybar", "mako",
+  "swaybg -c '#0d1117'",
+  "pipewire", "pipewire-pulse", "wireplumber",
 ]
 
 [[bind]]
@@ -532,33 +571,28 @@ keys = ["super", "shift", "l"]
 action = "move_right"
 
 [[bind]]
-keys = ["super", "1"]
-action = "workspace"
-n = 1
+keys = ["super", "ctrl", "l"]
+action = "spawn"
+cmd = "swaylock"
 
 [[bind]]
-keys = ["super", "2"]
-action = "workspace"
-n = 2
+keys = ["XF86AudioRaiseVolume"]
+action = "spawn"
+cmd = "wpctl set-volume @DEFAULT_SINK@ 5%+"
 
 [[bind]]
-keys = ["super", "3"]
-action = "workspace"
-n = 3
+keys = ["XF86AudioLowerVolume"]
+action = "spawn"
+cmd = "wpctl set-volume @DEFAULT_SINK@ 5%-"
 
 [[bind]]
-keys = ["super", "4"]
-action = "workspace"
-n = 4
-
-[[bind]]
-keys = ["super", "5"]
-action = "workspace"
-n = 5
+keys = ["XF86AudioMute"]
+action = "spawn"
+cmd = "wpctl set-mute @DEFAULT_SINK@ toggle"
 EOF
 
-# ── foot terminal ─────────────────────────────────────────────────
-cat > "$CFG/foot/foot.ini" <<'EOF'
+  # ── foot ────────────────────────────────────────────────────────
+  cat > "$CFG/foot/foot.ini" <<'EOF'
 [main]
 font=JetBrains Mono:size=11
 pad=8x8
@@ -568,7 +602,6 @@ term=xterm-256color
 lines=5000
 
 [colors]
-# GitHub Dark
 background=0d1117
 foreground=c9d1d9
 regular0=21262d
@@ -598,8 +631,8 @@ clipboard-copy=Control+Shift+c
 clipboard-paste=Control+Shift+v
 EOF
 
-# ── waybar ────────────────────────────────────────────────────────
-cat > "$CFG/waybar/config" <<'EOF'
+  # ── waybar ──────────────────────────────────────────────────────
+  cat > "$CFG/waybar/config" <<'EOF'
 {
   "layer": "top",
   "position": "top",
@@ -608,57 +641,35 @@ cat > "$CFG/waybar/config" <<'EOF'
   "modules-left": ["wlr/workspaces", "wlr/mode"],
   "modules-center": ["clock"],
   "modules-right": ["network", "pulseaudio", "cpu", "memory", "temperature", "tray"],
-
-  "wlr/workspaces": {
-    "on-click": "activate",
-    "format": "{name}"
-  },
-
+  "wlr/workspaces": { "on-click": "activate" },
   "clock": {
     "format": " {:%a %b %d  %H:%M}",
     "tooltip-format": "<big>{:%Y %B}</big>\n<tt><small>{calendar}</small></tt>"
   },
-
-  "cpu": {
-    "interval": 3,
-    "format": " {usage}%",
-    "tooltip": true
-  },
-
-  "memory": {
-    "interval": 5,
-    "format": " {used:.1f}G / {total:.1f}G"
-  },
-
+  "cpu":    { "interval": 3, "format": " {usage}%" },
+  "memory": { "interval": 5, "format": " {used:.1f}G / {total:.1f}G" },
   "temperature": {
-    "thermal-zone": 0,
     "critical-threshold": 85,
     "format": " {temperatureC}°C",
     "format-critical": " {temperatureC}°C"
   },
-
   "network": {
-    "interval": 5,
     "format-ethernet": " {bandwidthDownBytes}",
     "format-wifi": " {essid} {signalStrength}%",
     "format-disconnected": "⚠ offline",
     "tooltip-format": "{ifname}: {ipaddr}"
   },
-
   "pulseaudio": {
     "format": " {volume}%",
     "format-muted": " muted",
     "on-click": "wpctl set-mute @DEFAULT_SINK@ toggle",
     "on-click-right": "pavucontrol"
   },
-
-  "tray": {
-    "spacing": 8
-  }
+  "tray": { "spacing": 8 }
 }
 EOF
 
-cat > "$CFG/waybar/style.css" <<'EOF'
+  cat > "$CFG/waybar/style.css" <<'EOF'
 * {
   font-family: "JetBrains Mono", "Font Awesome 6 Free";
   font-size: 12px;
@@ -666,49 +677,36 @@ cat > "$CFG/waybar/style.css" <<'EOF'
   border-radius: 0;
   min-height: 0;
 }
-
 window#waybar {
   background: rgba(13, 17, 23, 0.92);
   color: #c9d1d9;
   border-bottom: 1px solid #30363d;
 }
-
 #workspaces button {
   padding: 2px 10px;
   color: #6e7681;
-  border-radius: 0;
   border-bottom: 2px solid transparent;
 }
-
-#workspaces button.active {
-  color: #58a6ff;
-  border-bottom: 2px solid #58a6ff;
-}
-
-#workspaces button:hover {
-  color: #c9d1d9;
-  background: #21262d;
-}
-
-#clock         { color: #c9d1d9; padding: 0 12px; }
-#cpu           { color: #3fb950; padding: 0 8px; }
-#memory        { color: #bc8cff; padding: 0 8px; }
-#temperature   { color: #d29922; padding: 0 8px; }
+#workspaces button.active  { color: #58a6ff; border-bottom: 2px solid #58a6ff; }
+#workspaces button:hover   { color: #c9d1d9; background: #21262d; }
+#clock       { color: #c9d1d9; padding: 0 12px; }
+#cpu         { color: #3fb950; padding: 0 8px; }
+#memory      { color: #bc8cff; padding: 0 8px; }
+#temperature { color: #d29922; padding: 0 8px; }
 #temperature.critical { color: #ff7b72; }
-#network       { color: #58a6ff; padding: 0 8px; }
-#pulseaudio    { color: #d29922; padding: 0 8px; }
-#tray          { padding: 0 8px; }
+#network     { color: #58a6ff; padding: 0 8px; }
+#pulseaudio  { color: #d29922; padding: 0 8px; }
+#tray        { padding: 0 8px; }
 EOF
 
-# ── fuzzel launcher ───────────────────────────────────────────────
-cat > "$CFG/fuzzel/fuzzel.ini" <<'EOF'
+  # ── fuzzel ──────────────────────────────────────────────────────
+  cat > "$CFG/fuzzel/fuzzel.ini" <<'EOF'
 [main]
 font=JetBrains Mono:size=12
 terminal=foot -e
 layer=overlay
 width=35
 lines=12
-tabs=4
 horizontal-pad=18
 vertical-pad=10
 inner-pad=4
@@ -727,8 +725,8 @@ width=1
 radius=4
 EOF
 
-# ── mako notifications ────────────────────────────────────────────
-cat > "$CFG/mako/config" <<'EOF'
+  # ── mako ────────────────────────────────────────────────────────
+  cat > "$CFG/mako/config" <<'EOF'
 background-color=#0d1117
 text-color=#c9d1d9
 border-color=#30363d
@@ -749,8 +747,8 @@ border-color=#ff7b72
 background-color=#3d1f1f
 EOF
 
-# ── swaylock ─────────────────────────────────────────────────────
-cat > "$CFG/swaylock/config" <<'EOF'
+  # ── swaylock ────────────────────────────────────────────────────
+  cat > "$CFG/swaylock/config" <<'EOF'
 color=0d1117
 indicator-radius=90
 indicator-thickness=6
@@ -764,15 +762,12 @@ text-color=c9d1d9
 font=JetBrains Mono
 EOF
 
-# ── .bashrc ───────────────────────────────────────────────────────
-cat > "$UHOME/.bashrc" <<'EOF'
-# ─── Interactive check ────────────────────────────────────────────
+  # ── .bashrc ─────────────────────────────────────────────────────
+  cat > "$UHOME/.bashrc" <<'EOF'
 [[ $- != *i* ]] && return
 
-# ─── Prompt ───────────────────────────────────────────────────────
 PS1='\[\e[36m\]\u\[\e[0m\]@\[\e[34m\]\h\[\e[0m\]:\[\e[33m\]\w\[\e[0m\]\$ '
 
-# ─── Aliases ──────────────────────────────────────────────────────
 alias ls='eza --icons --group-directories-first'
 alias ll='eza -la --icons --group-directories-first'
 alias lt='eza --tree --level=2 --icons'
@@ -791,43 +786,57 @@ alias pacc='sudo pacman -Sc'
 alias pacs='pacman -Ss'
 alias paci='sudo pacman -S'
 alias pacr='sudo pacman -Rns'
-alias paclogs='cat /var/log/pacman.log | tail -50'
 
-# ─── zoxide (smart cd) ────────────────────────────────────────────
 eval "$(zoxide init bash)"
 
-# ─── fzf ─────────────────────────────────────────────────────────
 [[ -f /usr/share/fzf/key-bindings.bash ]] && source /usr/share/fzf/key-bindings.bash
 [[ -f /usr/share/fzf/completion.bash   ]] && source /usr/share/fzf/completion.bash
 
-export FZF_DEFAULT_OPTS='--color=bg+:#21262d,bg:#0d1117,spinner:#58a6ff,hl:#58a6ff
+export FZF_DEFAULT_OPTS='
+  --color=bg+:#21262d,bg:#0d1117,spinner:#58a6ff,hl:#58a6ff
   --color=fg:#c9d1d9,header:#58a6ff,info:#d29922,pointer:#58a6ff
   --color=marker:#3fb950,fg+:#c9d1d9,prompt:#bc8cff,hl+:#79c0ff'
 
-# ─── Wayland env vars ─────────────────────────────────────────────
 export XDG_SESSION_TYPE=wayland
 export MOZ_ENABLE_WAYLAND=1
 export QT_QPA_PLATFORM=wayland
 export SDL_VIDEODRIVER=wayland
 export CLUTTER_BACKEND=wayland
 export _JAVA_AWT_WM_NONREPARENTING=1
-
-# ─── Preferred apps ───────────────────────────────────────────────
 export EDITOR=vim
 export VISUAL=vim
 export BROWSER=firefox
 export TERMINAL=foot
-
-# ─── Path additions ───────────────────────────────────────────────
 export PATH="$HOME/.local/bin:$PATH"
 EOF
 
-# ── .bash_profile — auto-start MangoWM on tty1 ───────────────────
-cat > "$UHOME/.bash_profile" <<'EOF'
-# Source .bashrc
+  # ── .bash_profile — auto-start MangoWM on tty1 ─────────────────
+  # FIX 2: If binary was detected at install time, hard-code it.
+  # Otherwise fall back to runtime detection — never fails silently.
+  # WLR_RENDERER removed — let wlroots auto-detect (vulkan flaky on HD 530).
+  if [[ -n "$MANGO_BIN" ]]; then
+    cat > "$UHOME/.bash_profile" <<EOF
 [[ -f ~/.bashrc ]] && . ~/.bashrc
 
-# Auto-start MangoWM on tty1 (no display manager)
+if [[ -z "\${WAYLAND_DISPLAY:-}" && "\${XDG_VTNR:-0}" -eq 1 ]]; then
+  export XDG_SESSION_TYPE=wayland
+  export XDG_CURRENT_DESKTOP=mango
+  export MOZ_ENABLE_WAYLAND=1
+  export QT_QPA_PLATFORM=wayland
+  export SDL_VIDEODRIVER=wayland
+  export CLUTTER_BACKEND=wayland
+  export _JAVA_AWT_WM_NONREPARENTING=1
+  export WLR_NO_HARDWARE_CURSORS=1   # set to 0 if cursor renders correctly
+
+  mkdir -p ~/.local/share/mango
+  exec ${MANGO_BIN} > ~/.local/share/mango/mango.log 2>&1
+fi
+EOF
+  else
+    # Binary unknown — detect at login time
+    cat > "$UHOME/.bash_profile" <<'EOF'
+[[ -f ~/.bashrc ]] && . ~/.bashrc
+
 if [[ -z "${WAYLAND_DISPLAY:-}" && "${XDG_VTNR:-0}" -eq 1 ]]; then
   export XDG_SESSION_TYPE=wayland
   export XDG_CURRENT_DESKTOP=mango
@@ -836,26 +845,34 @@ if [[ -z "${WAYLAND_DISPLAY:-}" && "${XDG_VTNR:-0}" -eq 1 ]]; then
   export SDL_VIDEODRIVER=wayland
   export CLUTTER_BACKEND=wayland
   export _JAVA_AWT_WM_NONREPARENTING=1
-  export WLR_RENDERER=vulkan        # Intel — try vulkan renderer
-  export WLR_NO_HARDWARE_CURSORS=0
+  export WLR_NO_HARDWARE_CURSORS=1   # set to 0 if cursor renders correctly
 
-  mkdir -p ~/.local/share/mango
-  exec mango > ~/.local/share/mango/mango.log 2>&1
+  MANGO_BIN=""
+  for b in mango mangowm mango-wm; do
+    command -v "$b" &>/dev/null && MANGO_BIN="$b" && break
+  done
+
+  if [[ -z "$MANGO_BIN" ]]; then
+    echo "ERROR: MangoWM not found. Run: paru -S mangowm"
+    sleep 5
+  else
+    mkdir -p ~/.local/share/mango
+    exec "$MANGO_BIN" > ~/.local/share/mango/mango.log 2>&1
+  fi
 fi
 EOF
+  fi
 
-# ── .vimrc ────────────────────────────────────────────────────────
-cat > "$UHOME/.vimrc" <<'EOF'
+  # ── .vimrc ──────────────────────────────────────────────────────
+  cat > "$UHOME/.vimrc" <<'EOF'
 set nocompatible
 set number relativenumber
 set expandtab tabstop=2 shiftwidth=2
 set smartindent autoindent
 set incsearch hlsearch ignorecase smartcase
 set wildmenu wildmode=longest:full
-set laststatus=2
-set ruler showcmd
-set wrap linebreak
-set scrolloff=5
+set laststatus=2 ruler showcmd
+set wrap linebreak scrolloff=5
 set backspace=indent,eol,start
 set encoding=utf-8
 set mouse=a
@@ -864,79 +881,94 @@ syntax on
 colorscheme desert
 EOF
 
-# ── Fix ownership ─────────────────────────────────────────────────
-chown -R 1000:1000 "$UHOME"
-ok "All config files deployed and ownership set"
+  # FIX 4: Use username string — UID 1000 is not guaranteed
+  chown -R "${USERNAME}:${USERNAME}" "$UHOME"
+  ok "Configs deployed — ownership: ${USERNAME}:${USERNAME}"
+
+  checkpoint "CONFIGS"
+fi
 
 # =============================================================================
-# PHASE 5 — VERIFY & UNMOUNT
+# PHASE 7 — VERIFY
 # =============================================================================
 step "Verifying installation"
 
-checks_passed=0
-checks_total=0
+checks_passed=0; checks_total=0
 
 check() {
-  local label="$1"; local path="$2"; checks_total=$((checks_total+1))
+  local label="$1" path="$2"
+  checks_total=$((checks_total + 1))
   if [[ -e "$MOUNT/$path" ]]; then
-    ok "$label"; checks_passed=$((checks_passed+1))
+    ok "$label"
+    checks_passed=$((checks_passed + 1))
   else
     warn "$label — NOT FOUND: $path"
   fi
 }
 
-check "Kernel"          "boot/vmlinuz-linux"
-check "Initramfs"       "boot/initramfs-linux.img"
-check "GRUB EFI"        "boot/efi/EFI/artix/grubx64.efi"
-check "fstab"           "etc/fstab"
-check "s6 scripts"      "etc/s6"
-check "NetworkManager"  "usr/bin/NetworkManager"
-check "MangoWM"         "usr/bin/mango"
-check "foot"            "usr/bin/foot"
-check "waybar"          "usr/bin/waybar"
-check "pipewire"        "usr/bin/pipewire"
-check "XWayland"        "usr/bin/Xwayland"
-check "User home"       "home/${USERNAME}"
-check "MangoWM config"  "home/${USERNAME}/.config/mango/config.lua"
-check "foot config"     "home/${USERNAME}/.config/foot/foot.ini"
-check "bash_profile"    "home/${USERNAME}/.bash_profile"
+# FIX 7: Check all known MangoWM binary names — pass if any one exists
+check_any() {
+  local label="$1"; shift
+  checks_total=$((checks_total + 1))
+  for path in "$@"; do
+    if [[ -e "$MOUNT/$path" ]]; then
+      ok "$label  (${path##*/})"
+      checks_passed=$((checks_passed + 1))
+      return
+    fi
+  done
+  warn "$label — not found at any of: $*"
+}
+
+check     "Kernel"         "boot/vmlinuz-linux"
+check     "Initramfs"      "boot/initramfs-linux.img"
+check     "GRUB EFI"       "boot/efi/EFI/artix/grubx64.efi"
+check     "fstab"          "etc/fstab"
+check     "s6 dir"         "etc/s6"
+check     "NetworkManager" "usr/bin/NetworkManager"
+check     "foot"           "usr/bin/foot"
+check     "waybar"         "usr/bin/waybar"
+check     "pipewire"       "usr/bin/pipewire"
+check     "XWayland"       "usr/bin/Xwayland"
+check     "User home"      "home/${USERNAME}"
+check     "foot config"    "home/${USERNAME}/.config/foot/foot.ini"
+check     "bash_profile"   "home/${USERNAME}/.bash_profile"
+check_any "MangoWM"        "usr/bin/mango" "usr/bin/mangowm" "usr/bin/mango-wm"
 
 echo ""
 echo -e "  Checks: ${GRN}${checks_passed}${RST} / ${checks_total} passed"
+[[ $checks_passed -lt $checks_total ]] && \
+  warn "$((checks_total - checks_passed)) check(s) failed — review above before rebooting"
 
+checkpoint "VERIFIED"
+
+# =============================================================================
+# UNMOUNT
+# =============================================================================
 step "Unmounting"
 sync
 umount -R "$MOUNT"
-ok "All filesystems unmounted"
+ok "Unmounted cleanly"
 
-# ─── Final summary ────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}${GRN}"
 cat <<'DONE'
-  ┌────────────────────────────────────────────────────────┐
-  │   Installation complete!                               │
-  └────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────┐
+  │   Installation complete!                                 │
+  └──────────────────────────────────────────────────────────┘
 DONE
 echo -e "${RST}"
 echo -e "  ${BOLD}Post-boot checklist:${RST}"
 echo ""
-echo -e "  1. ${YLW}Change root password${RST}"
-echo -e "     # passwd"
+echo -e "  1. ${YLW}Change root password${RST}   →  passwd"
+echo -e "  2. ${YLW}Change user password${RST}   →  passwd ${USERNAME}"
+echo -e "  3. ${YLW}Connect network${RST}        →  nmtui"
+echo -e "  4. ${YLW}Verify s6 services${RST}     →  s6-rc -a list"
+echo -e "  5. ${YLW}Check MangoWM config${RST}   →  mango --help  (Lua vs TOML)"
+echo -e "     Delete whichever config.{lua,toml} doesn't match your build."
 echo ""
-echo -e "  2. ${YLW}Change user password${RST}"
-echo -e "     # passwd ${USERNAME}"
+echo -e "  Log in as ${USERNAME} on tty1 — MangoWM starts automatically."
+echo -e "  If it fails: check ~/.local/share/mango/mango.log"
 echo ""
-echo -e "  3. ${YLW}Connect to network${RST}"
-echo -e "     $ nmtui"
-echo ""
-echo -e "  4. ${YLW}Verify s6 services${RST}"
-echo -e "     $ s6-rc -a list"
-echo ""
-echo -e "  5. ${YLW}Log in as ${USERNAME} on tty1 — MangoWM starts automatically${RST}"
-echo ""
-echo -e "  6. ${YLW}Check MangoWM config format (Lua vs TOML)${RST}"
-echo -e "     $ mango --help  |  $ mango --version"
-echo -e "     Both config.lua and config.toml are deployed — keep only the correct one."
-echo ""
-echo -e "  ${CYN}Reboot now:${RST} reboot"
+echo -e "  ${CYN}Reboot:${RST}  reboot"
 echo ""
