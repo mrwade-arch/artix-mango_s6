@@ -228,11 +228,23 @@ install_base(){
     return
   fi
   step "Installing base system"
-  run "basestrap '$MOUNT' ${BASE_PKGS[*]}"
+  
+  # Use an array to hold the command so Bash treats the packages as arguments
+  local cmd=(basestrap "$MOUNT" "${BASE_PKGS[@]}")
+  
+  # Execute the array
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[DRY] ${cmd[*]}"
+  else
+    echo "[RUN] ${cmd[*]}"
+    "${cmd[@]}"
+  fi
+  
   run "fstabgen -U '$MOUNT' >> '$MOUNT/etc/fstab'"
   mark_done basestrap
   ok "Base installed"
 }
+
 
 # -------------------------------
 # Phase 5: chroot config
@@ -279,8 +291,8 @@ pacman -Sy --noconfirm
 
 # Packages for desktop
 pacman -S --noconfirm --needed \
-  ${WAYLAND_PKGS[*]} \
-  ${DESKTOP_PKGS[*]}
+  "${WAYLAND_PKGS[@]}" \
+  "${DESKTOP_PKGS[@]}"
 
 # s6 service enablement; official Artix s6 instructions use contents.d + s6-db-reload
 if [[ -d /etc/s6/adminsv/default/contents.d ]]; then
